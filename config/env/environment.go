@@ -68,6 +68,9 @@ type Env struct {
 	// JaegerTracingHost env
 	JaegerTracingHost string
 
+	// Jaeger max packet size in bytes (used by tracer clients)
+	JaegerMaxPacketSize int
+
 	// Broker environment
 	Kafka struct {
 		Brokers       []string
@@ -124,31 +127,67 @@ func Load(serviceName string) {
 	parseAppConfig()
 	env.BuildNumber = os.Getenv("BUILD_NUMBER")
 
-	if env.LoadConfigTimeout, err = time.ParseDuration(os.Getenv("LOAD_CONFIG_TIMEOUT")); err != nil {
-		env.LoadConfigTimeout = 10 * time.Second // default value
+	// LoadConfigTimeout
+	if v, ok := os.LookupEnv("LOAD_CONFIG_TIMEOUT"); ok && strings.TrimSpace(v) != "" {
+		if env.LoadConfigTimeout, err = time.ParseDuration(v); err != nil {
+			env.LoadConfigTimeout = 10 * time.Second // fallback
+		}
+	} else {
+		env.LoadConfigTimeout = 10 * time.Second
+	}
+
+	// ------------------------------------
+	// parse Jaeger max packet size (bytes) with default e.g. 65000
+	if v, ok := os.LookupEnv("JAEGER_MAX_PACKET_SIZE"); ok && strings.TrimSpace(v) != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			env.JaegerMaxPacketSize = n
+		} else {
+			env.JaegerMaxPacketSize = 65000
+		}
+	} else {
+		env.JaegerMaxPacketSize = 65000
 	}
 
 	// ------------------------------------
 	isServerActive := env.UseREST || env.UseGraphQL || env.UseGRPC
 	if isServerActive {
-		httpPort, _ := strconv.Atoi(os.Getenv("HTTP_PORT"))
+		// HTTP_PORT default 8080
+		httpPortStr, ok := os.LookupEnv("HTTP_PORT")
+		if !ok || strings.TrimSpace(httpPortStr) == "" {
+			httpPortStr = "8080"
+		}
+		httpPort, perr := strconv.Atoi(httpPortStr)
+		if perr != nil || httpPort <= 0 || httpPort > 65535 {
+			mErrs.Append("HTTP_PORT", errors.New("missing or invalid value for HTTP_PORT environment"))
+		}
 		env.HTTPPort = uint16(httpPort)
-		grpcPort, _ := strconv.Atoi(os.Getenv("GRPC_PORT"))
+
+		// GRPC_PORT default 50051
+		grpcPortStr, ok := os.LookupEnv("GRPC_PORT")
+		if !ok || strings.TrimSpace(grpcPortStr) == "" {
+			grpcPortStr = "50051"
+		}
+		grpcPort, gerr := strconv.Atoi(grpcPortStr)
+		if gerr != nil || grpcPort <= 0 || grpcPort > 65535 {
+			// don't fail hard, just default
+			grpcPort = 50051
+		}
 		env.GRPCPort = uint16(grpcPort)
 
 		env.UseSharedListener = parseBool("USE_SHARED_LISTENER")
-		if env.UseSharedListener && env.HTTPPort <= 0 {
+		if env.UseSharedListener && env.HTTPPort == 0 {
 			mErrs.Append("USE_SHARED_LISTENER", errors.New("missing or invalid value for HTTP_PORT environment"))
 		}
 	}
 
+	// Task queue dashboard port
 	if env.UseTaskQueueWorker {
 		taskQueueDashboardPort, ok := os.LookupEnv("TASK_QUEUE_DASHBOARD_PORT")
-		if !ok {
+		if !ok || strings.TrimSpace(taskQueueDashboardPort) == "" {
 			taskQueueDashboardPort = "8080"
 		}
 		port, err := strconv.Atoi(taskQueueDashboardPort)
-		if err != nil {
+		if err != nil || port <= 0 || port > 65535 {
 			mErrs.Append("TASK_QUEUE_DASHBOARD_PORT", errors.New("TASK_QUEUE_DASHBOARD_PORT environment must in integer format"))
 		}
 		env.TaskQueueDashboardPort = uint16(port)
@@ -160,9 +199,9 @@ func Load(serviceName string) {
 
 	// ------------------------------------
 	env.Environment = os.Getenv("ENVIRONMENT")
-	env.DebugMode, err = strconv.ParseBool(os.Getenv("DEBUG_MODE"))
-	if err != nil {
-		env.DebugMode = true
+	env.DebugMode = true // default true
+	if v, ok := os.LookupEnv("DEBUG_MODE"); ok && strings.TrimSpace(v) != "" {
+		env.DebugMode, _ = strconv.ParseBool(v)
 	}
 
 	env.GraphQLDisableIntrospection = parseBool("GRAPHQL_DISABLE_INTROSPECTION")
@@ -272,45 +311,58 @@ func parseAppConfig() {
 }
 
 func parseBrokerEnv(mErrs candishared.MultiError) {
-	kafkaBrokerEnv := os.Getenv("KAFKA_BROKERS")
-	env.Kafka.Brokers = strings.Split(kafkaBrokerEnv, ",") // optional
-	env.Kafka.ClientID = os.Getenv("KAFKA_CLIENT_ID")      // optional
-	env.Kafka.ClientVersion = os.Getenv("KAFKA_CLIENT_VERSION")
+	kafkaBrokerEnv := strings.TrimSpace(os.Getenv("KAFKA_BROKERS"))
+	if kafkaBrokerEnv == "" {
+		env.Kafka.Brokers = []string{}
+	} else {
+		// trim spaces for each broker
+		parts := strings.Split(kafkaBrokerEnv, ",")
+		for i := range parts {
+			parts[i] = strings.TrimSpace(parts[i])
+		}
+		env.Kafka.Brokers = parts
+	}
+	env.Kafka.ClientID = strings.TrimSpace(os.Getenv("KAFKA_CLIENT_ID"))
+	env.Kafka.ClientVersion = strings.TrimSpace(os.Getenv("KAFKA_CLIENT_VERSION"))
 	if env.UseKafkaConsumer {
-		if kafkaBrokerEnv == "" {
+		if len(env.Kafka.Brokers) == 0 {
 			mErrs.Append("KAFKA_BROKERS", errors.New("kafka consumer is active, missing KAFKA_BROKERS environment"))
 		}
 
 		var ok bool
 		env.Kafka.ConsumerGroup, ok = os.LookupEnv("KAFKA_CONSUMER_GROUP")
-		if !ok {
+		if !ok || strings.TrimSpace(env.Kafka.ConsumerGroup) == "" {
 			mErrs.Append("KAFKA_CONSUMER_GROUP", errors.New("kafka consumer is active, missing KAFKA_CONSUMER_GROUP environment"))
 		}
 	}
-	env.RabbitMQ.Broker = os.Getenv("RABBITMQ_BROKER")
-	env.RabbitMQ.ConsumerGroup = os.Getenv("RABBITMQ_CONSUMER_GROUP")
-	env.RabbitMQ.ExchangeName = os.Getenv("RABBITMQ_EXCHANGE_NAME")
+	env.RabbitMQ.Broker = strings.TrimSpace(os.Getenv("RABBITMQ_BROKER"))
+	env.RabbitMQ.ConsumerGroup = strings.TrimSpace(os.Getenv("RABBITMQ_CONSUMER_GROUP"))
+	env.RabbitMQ.ExchangeName = strings.TrimSpace(os.Getenv("RABBITMQ_EXCHANGE_NAME"))
 }
 
 func parseDatabaseEnv() {
-	env.DbMongoWriteHost = os.Getenv("MONGODB_HOST_WRITE")
-	env.DbMongoReadHost = os.Getenv("MONGODB_HOST_READ")
+	env.DbMongoWriteHost = strings.TrimSpace(os.Getenv("MONGODB_HOST_WRITE"))
+	env.DbMongoReadHost = strings.TrimSpace(os.Getenv("MONGODB_HOST_READ"))
 
-	env.DbSQLReadDSN = os.Getenv("SQL_DB_READ_DSN")
-	env.DbSQLWriteDSN = os.Getenv("SQL_DB_WRITE_DSN")
+	env.DbSQLReadDSN = strings.TrimSpace(os.Getenv("SQL_DB_READ_DSN"))
+	env.DbSQLWriteDSN = strings.TrimSpace(os.Getenv("SQL_DB_WRITE_DSN"))
 
-	env.DbRedisReadDSN = os.Getenv("REDIS_READ_DSN")
-	env.DbRedisWriteDSN = os.Getenv("REDIS_WRITE_DSN")
+	env.DbRedisReadDSN = strings.TrimSpace(os.Getenv("REDIS_READ_DSN"))
+	env.DbRedisWriteDSN = strings.TrimSpace(os.Getenv("REDIS_WRITE_DSN"))
 }
 
 func parseCorsEnv() {
-	CORSAllowOrigins := os.Getenv("CORS_ALLOW_ORIGINS")
+	CORSAllowOrigins := strings.TrimSpace(os.Getenv("CORS_ALLOW_ORIGINS"))
 	if CORSAllowOrigins == "" {
 		env.CORSAllowOrigins = []string{"*"}
 	} else {
-		env.CORSAllowOrigins = strings.Split(CORSAllowOrigins, ",")
+		parts := strings.Split(CORSAllowOrigins, ",")
+		for i := range parts {
+			parts[i] = strings.TrimSpace(parts[i])
+		}
+		env.CORSAllowOrigins = parts
 	}
-	CORSAllowMethods := os.Getenv("CORS_ALLOW_METHODS")
+	CORSAllowMethods := strings.TrimSpace(os.Getenv("CORS_ALLOW_METHODS"))
 	if CORSAllowMethods == "" {
 		env.CORSAllowMethods = []string{
 			http.MethodGet,
@@ -321,11 +373,19 @@ func parseCorsEnv() {
 			http.MethodDelete,
 		}
 	} else {
-		env.CORSAllowMethods = strings.Split(CORSAllowMethods, ",")
+		parts := strings.Split(CORSAllowMethods, ",")
+		for i := range parts {
+			parts[i] = strings.TrimSpace(parts[i])
+		}
+		env.CORSAllowMethods = parts
 	}
-	CORSAllowHeaders := os.Getenv("CORS_ALLOW_HEADERS")
+	CORSAllowHeaders := strings.TrimSpace(os.Getenv("CORS_ALLOW_HEADERS"))
 	if CORSAllowHeaders != "" {
-		env.CORSAllowHeaders = strings.Split(CORSAllowHeaders, ",")
+		parts := strings.Split(CORSAllowHeaders, ",")
+		for i := range parts {
+			parts[i] = strings.TrimSpace(parts[i])
+		}
+		env.CORSAllowHeaders = parts
 	}
 	env.CORSAllowCredential, _ = strconv.ParseBool(os.Getenv("CORS_ALLOW_CREDENTIAL"))
 }
