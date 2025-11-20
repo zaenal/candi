@@ -1,4 +1,4 @@
-module github.com/zaenal/candi
+module github.com/golangid/candi
 
 go 1.25.3
 
